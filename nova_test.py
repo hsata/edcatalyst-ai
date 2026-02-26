@@ -2,7 +2,7 @@ import os
 import boto3
 
 REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-MODEL_ID = os.environ["NOVA_MODEL_ID"]
+MODEL_ID = os.environ["amazon.nova-2-lite-v1:0"]
 
 client = boto3.client("bedrock-runtime", region_name=REGION)
 

@@ -1,3 +1,6 @@
+from http import client
+from random import seed
+from weakref import ref
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import arxiv
@@ -8,6 +11,9 @@ import json
 
 
 app = FastAPI(title="EdCatalyst AI")
+
+from fastapi import HTTPException
+import traceback
 
 @app.get("/")
 def read_root():
@@ -34,27 +40,30 @@ class Plan(BaseModel):
     refined_queries: List[str]
     screening_criteria: List[str]
 
-class AnalyzeResponse(BaseModel):
-    topic: str
-    plan: Plan
-    papers: List[Paper]
-    access_gaps: List[str]
-    research_ideas: List[str]
-    impact_score: int
-    impact_reasons: List[str]
+class SelectedPaper(BaseModel):
+    title: str
+    arxiv_url: str
+    why_selected: str
+
+class ActionPlan(BaseModel):
+    for_teachers: List[str]
+    for_schools: List[str]
+    next_7_days: List[str]
 
 class GroundedItem(BaseModel):
-    item: str
-    evidence: str  # cite paper title(s) or key phrase
-
+            item: str
+            evidence: str
+    
 class AnalyzeResponse(BaseModel):
-    topic: str
-    plan: Plan
-    papers: List[Paper]
-    access_gaps: List[GroundedItem]
-    research_ideas: List[GroundedItem]
-    impact_score: int
-    impact_reasons: List[str]
+        topic: str
+        plan: Plan
+        papers: List[Paper]
+        selected_papers: List[SelectedPaper]
+        access_gaps: List[GroundedItem]
+        research_ideas: List[GroundedItem]
+        action_plan: ActionPlan
+        impact_score: int
+        impact_reasons: List[str]
 
 EDU_KEYWORDS = [
     "education", "student", "learning", "tutor", "classroom", "school",
@@ -143,35 +152,45 @@ def nova_reasoning(topic: str, papers: List[Paper]):
     client = boto3.client("bedrock-runtime", region_name=REGION)
 
     paper_summaries = "\n\n".join(
-        [f"Title: {p.title}\nSummary: {p.summary[:800]}" for p in papers[:4]]
-    )
+    [f"Title: {p.title}\nArxiv: {p.arxiv_url}\nSummary: {p.summary[:800]}" for p in papers[:6]]
+)
 
     prompt = f"""
 Return ONLY valid JSON. No extra text.
 
 Topic: {topic}
 
-Papers (use these as evidence):
+Candidate papers (choose the most useful):
 {paper_summaries}
 
 Output EXACTLY this JSON schema:
 {{
+  "selected_papers": [
+    {{"title": "paper title", "arxiv_url": "url", "why_selected": "1-2 sentences"}}
+  ],
   "access_gaps": [
-    {{"item": "gap text", "evidence": "evidence referencing at least 1 paper title"}}
+    {{"item": "gap text", "evidence": "must reference at least 1 paper title"}}
   ],
   "research_ideas": [
-    {{"item": "idea text", "evidence": "evidence referencing at least 1 paper title"}}
+    {{"item": "idea text", "evidence": "must reference at least 1 paper title"}}
   ],
+  "action_plan": {{
+    "for_teachers": ["...", "...", "..."],
+    "for_schools": ["...", "...", "..."],
+    "next_7_days": ["...", "...", "..."]
+  }},
   "impact_score": 0,
   "impact_reasons": ["reason1", "reason2"]
 }}
 
 Rules:
+- selected_papers must be exactly 3 items chosen from candidate papers.
 - access_gaps must have exactly 5 objects.
 - research_ideas must have exactly 5 objects.
-- Each evidence must mention at least one paper title from the provided list.
-- impact_score must be an integer 0-100.
-- impact_reasons must be exactly 2 strings.
+- action_plan lists must each have exactly 3 items.
+- evidence must mention at least one provided paper title.
+- impact_score is integer 0-100.
+- impact_reasons exactly 2 strings.
 """
 
 
@@ -203,6 +222,7 @@ def analyze(req: AnalyzeRequest):
             max_results=req.max_papers,
             sort_by=arxiv.SortCriterion.Relevance
         )
+
         for r in client.results(search):
             if r.entry_id in seen:
                 continue
@@ -235,26 +255,72 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-  
-    
+    # Helpers to normalize Nova output shapes
+    def ensure_grounded_list(x):
+        if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "item" in x[0]:
+            return x
+        if isinstance(x, list) and (len(x) == 0 or isinstance(x[0], str)):
+            return [{"item": s, "evidence": "N/A"} for s in x]
+        return []
+
+    def ensure_selected_list(x):
+        if isinstance(x, list) and len(x) > 0 and isinstance(x[0], dict) and "title" in x[0]:
+            return x
+        return []
+
+    def ensure_action_plan(x):
+        if isinstance(x, dict):
+            return {
+                "for_teachers": x.get("for_teachers", [])[:3],
+                "for_schools": x.get("for_schools", [])[:3],
+                "next_7_days": x.get("next_7_days", [])[:3],
+            }
+        return {"for_teachers": [], "for_schools": [], "next_7_days": []}
+
     # 4) Call Nova ONCE (after papers are ready)
     try:
         nova_text = nova_reasoning(req.topic, papers)
+        # If extract_json_object is not defined, replace next line with: nova_json = json.loads(nova_text)
         nova_json = json.loads(extract_json_object(nova_text))
     except Exception as e:
+        fallback_selected = [
+            {"title": p.title, "arxiv_url": p.arxiv_url, "why_selected": "Fallback selection (no Nova)."}
+            for p in papers[:3]
+        ]
+        fallback_action = {
+            "for_teachers": [
+                "Use offline-friendly resources (downloadable PDFs/videos) and schedule sync times.",
+                "Collect quick weekly feedback to adapt lessons for low-connectivity students.",
+                "Pair students for peer learning when connectivity is limited."
+            ],
+            "for_schools": [
+                "Create a shared local content library on one device/hotspot for classroom use.",
+                "Set a weekly connectivity window to sync updates and upload progress.",
+                "Prioritize low-cost devices and local-language materials where possible."
+            ],
+            "next_7_days": [
+                "Pick 1 topic + create a small offline lesson pack (PDF + 5 questions).",
+                "Run a 20-minute pilot with 3 students; note friction points.",
+                "Refine and rerun; document before/after outcomes."
+            ]
+        }
         nova_json = {
-            "access_gaps": generate_gaps(req.topic, papers),
-            "research_ideas": generate_ideas(req.topic),
+            "selected_papers": fallback_selected,
+            "access_gaps": [{"item": g, "evidence": "Fallback (no Nova)."} for g in generate_gaps(req.topic, papers)],
+            "research_ideas": [{"item": i, "evidence": "Fallback (no Nova)."} for i in generate_ideas(req.topic)],
+            "action_plan": fallback_action,
             "impact_score": 70,
             "impact_reasons": [f"Nova failed: {type(e).__name__}", "Used fallback."]
-    }
-    
+        }
+
     return AnalyzeResponse(
         topic=req.topic,
         plan=plan,
         papers=papers,
-        access_gaps=nova_json.get("access_gaps", generate_gaps(req.topic, papers)),
-        research_ideas=nova_json.get("research_ideas", generate_ideas(req.topic)),
+        selected_papers=ensure_selected_list(nova_json.get("selected_papers", [])),
+        access_gaps=ensure_grounded_list(nova_json.get("access_gaps", [])),
+        research_ideas=ensure_grounded_list(nova_json.get("research_ideas", [])),
+        action_plan=ensure_action_plan(nova_json.get("action_plan", {})),
         impact_score=int(nova_json.get("impact_score", 70)),
         impact_reasons=nova_json.get("impact_reasons", ["No reasons provided."])
-)
+    )
