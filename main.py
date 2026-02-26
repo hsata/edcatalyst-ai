@@ -2,6 +2,10 @@ from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import arxiv
 from typing import List
+import boto3
+import os
+import json
+
 
 app = FastAPI(title="EdCatalyst AI")
 
@@ -36,6 +40,19 @@ class AnalyzeResponse(BaseModel):
     papers: List[Paper]
     access_gaps: List[str]
     research_ideas: List[str]
+    impact_score: int
+    impact_reasons: List[str]
+
+class GroundedItem(BaseModel):
+    item: str
+    evidence: str  # cite paper title(s) or key phrase
+
+class AnalyzeResponse(BaseModel):
+    topic: str
+    plan: Plan
+    papers: List[Paper]
+    access_gaps: List[GroundedItem]
+    research_ideas: List[GroundedItem]
     impact_score: int
     impact_reasons: List[str]
 
@@ -112,28 +129,94 @@ def impact_score_and_reasons(papers: List[Paper]) -> tuple[int, List[str]]:
     ]
     return score, reasons
 
+def extract_json_object(text: str) -> str:
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("No JSON object found in Nova output.")
+    return text[start:end+1]
+
+def nova_reasoning(topic: str, papers: List[Paper]):
+    REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
+    MODEL_ID = os.environ.get("NOVA_MODEL_ID")
+
+    client = boto3.client("bedrock-runtime", region_name=REGION)
+
+    paper_summaries = "\n\n".join(
+        [f"Title: {p.title}\nSummary: {p.summary[:800]}" for p in papers[:4]]
+    )
+
+    prompt = f"""
+Return ONLY valid JSON. No extra text.
+
+Topic: {topic}
+
+Papers (use these as evidence):
+{paper_summaries}
+
+Output EXACTLY this JSON schema:
+{{
+  "access_gaps": [
+    {{"item": "gap text", "evidence": "evidence referencing at least 1 paper title"}}
+  ],
+  "research_ideas": [
+    {{"item": "idea text", "evidence": "evidence referencing at least 1 paper title"}}
+  ],
+  "impact_score": 0,
+  "impact_reasons": ["reason1", "reason2"]
+}}
+
+Rules:
+- access_gaps must have exactly 5 objects.
+- research_ideas must have exactly 5 objects.
+- Each evidence must mention at least one paper title from the provided list.
+- impact_score must be an integer 0-100.
+- impact_reasons must be exactly 2 strings.
+"""
+
+
+    response = client.converse(
+        modelId=MODEL_ID,
+        messages=[
+            {"role": "user", "content": [{"text": prompt}]}
+        ],
+        inferenceConfig={"maxTokens": 900, "temperature": 0.0},
+    )
+
+    text_output = response["output"]["message"]["content"][0]["text"]
+
+    return text_output
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 def analyze(req: AnalyzeRequest):
     plan = make_plan(req.topic)
 
+    # 1) Retrieve
     client = arxiv.Client()
     seen = set()
     raw_results = []
 
     for q in plan.refined_queries:
-        search = arxiv.Search(query=q, max_results=req.max_papers, sort_by=arxiv.SortCriterion.Relevance)
+        search = arxiv.Search(
+            query=q,
+            max_results=req.max_papers,
+            sort_by=arxiv.SortCriterion.Relevance
+        )
         for r in client.results(search):
             if r.entry_id in seen:
                 continue
             seen.add(r.entry_id)
             raw_results.append(r)
 
+    # 2) Score + sort
     scored = []
     for r in raw_results:
         s, reason = score_relevance(r.title or "", r.summary or "")
         scored.append((s, reason, r))
     scored.sort(key=lambda x: x[0], reverse=True)
 
+    # 3) Build top papers list (NO Nova calls here)
     papers: List[Paper] = []
     for s, reason, r in scored:
         if len(papers) >= 6:
@@ -152,16 +235,26 @@ def analyze(req: AnalyzeRequest):
             )
         )
 
-    gaps = generate_gaps(req.topic, papers)
-    ideas = generate_ideas(req.topic)
-    score, score_reasons = impact_score_and_reasons(papers)
-
+  
+    
+    # 4) Call Nova ONCE (after papers are ready)
+    try:
+        nova_text = nova_reasoning(req.topic, papers)
+        nova_json = json.loads(extract_json_object(nova_text))
+    except Exception as e:
+        nova_json = {
+            "access_gaps": generate_gaps(req.topic, papers),
+            "research_ideas": generate_ideas(req.topic),
+            "impact_score": 70,
+            "impact_reasons": [f"Nova failed: {type(e).__name__}", "Used fallback."]
+    }
+    
     return AnalyzeResponse(
         topic=req.topic,
         plan=plan,
         papers=papers,
-        access_gaps=gaps,
-        research_ideas=ideas,
-        impact_score=score,
-        impact_reasons=score_reasons
-    )
+        access_gaps=nova_json.get("access_gaps", generate_gaps(req.topic, papers)),
+        research_ideas=nova_json.get("research_ideas", generate_ideas(req.topic)),
+        impact_score=int(nova_json.get("impact_score", 70)),
+        impact_reasons=nova_json.get("impact_reasons", ["No reasons provided."])
+)
