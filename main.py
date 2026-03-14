@@ -8,6 +8,8 @@ from typing import List
 import boto3
 import os
 import json
+import re
+import ast
 
 
 app = FastAPI(title="EdCatalyst AI")
@@ -145,6 +147,33 @@ def extract_json_object(text: str) -> str:
         raise ValueError("No JSON object found in Nova output.")
     return text[start:end+1]
 
+def parse_nova_json(text: str):
+    cleaned = text.strip()
+
+    # Remove markdown fences
+    cleaned = re.sub(r"^```json\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^```\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+
+    # Keep only outermost JSON object
+    cleaned = extract_json_object(cleaned)
+
+    # Remove trailing commas before } or ]
+    cleaned = re.sub(r",\s*}", "}", cleaned)
+    cleaned = re.sub(r",\s*]", "]", cleaned)
+
+    # Normalize smart quotes
+    cleaned = cleaned.replace("“", '"').replace("”", '"').replace("‘", "'").replace("’", "'")
+
+    # Remove stray control chars
+    cleaned = "".join(ch for ch in cleaned if ch == "\n" or ch == "\t" or ord(ch) >= 32)
+
+    try:
+        return json.loads(cleaned)
+    except Exception:
+        return ast.literal_eval(cleaned)
+
+
 def nova_reasoning(topic: str, papers: List[Paper]):
     REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
     MODEL_ID = os.environ.get("NOVA_MODEL_ID")
@@ -156,7 +185,13 @@ def nova_reasoning(topic: str, papers: List[Paper]):
 )
 
     prompt = f"""
-Return ONLY valid JSON. No extra text.
+Return ONLY one valid JSON object.
+No markdown.
+No code fences.
+No commentary.
+No explanations.
+Do not wrap the JSON in backticks.
+Do not include trailing commas.
 
 Topic: {topic}
 
@@ -182,6 +217,7 @@ Output EXACTLY this JSON schema:
   "impact_score": 0,
   "impact_reasons": ["reason1", "reason2"]
 }}
+
 
 Rules:
 - selected_papers must be exactly 3 items chosen from candidate papers.
@@ -281,7 +317,8 @@ def analyze(req: AnalyzeRequest):
     try:
         nova_text = nova_reasoning(req.topic, papers)
         # If extract_json_object is not defined, replace next line with: nova_json = json.loads(nova_text)
-        nova_json = json.loads(extract_json_object(nova_text))
+        nova_json = parse_nova_json(nova_text)
+        
     except Exception as e:
         fallback_selected = [
             {"title": p.title, "arxiv_url": p.arxiv_url, "why_selected": "Fallback selection (no Nova)."}
